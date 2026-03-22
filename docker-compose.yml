@@ -30,7 +30,7 @@ services:
     depends_on:
       - redis
     command: >
-      bash -c "pip install . &&
+      bash -c "pip install -r requirements.txt &&
                director db upgrade &&
                director webserver -b 0.0.0.0:8000"
 
@@ -46,7 +46,7 @@ services:
       - director-web
       - model-service
     command: >
-      bash -c "pip install . &&
+      bash -c "pip install -r requirements.txt &&
                director celery worker --loglevel=INFO"
 
 volumes:
