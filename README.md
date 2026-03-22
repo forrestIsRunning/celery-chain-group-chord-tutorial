@@ -300,6 +300,121 @@ A succeeds → B retries 3x and fails, C succeeds → chord dependency failed �
 
 ---
 
+## Inspecting Task Status & Errors
+
+Every task's status and result (including error details) can be queried after execution. There are three ways to do this:
+
+### Method 1: Director REST API (Recommended)
+
+The Director API returns the full workflow with every task's status, result, and error traceback:
+
+```bash
+# Get workflow detail by ID
+curl -s http://localhost:8000/api/workflows/<workflow_id> | python3 -m json.tool
+```
+
+**Success task** returns its result data:
+```json
+{
+  "key": "TASK_A",
+  "status": "success",
+  "result": {
+    "processed": "HELLO WORLD",
+    "length": 11,
+    "model": "text-preprocessor-v1",
+    "retries_used": 0
+  }
+}
+```
+
+**Failed task** returns the exception and full traceback:
+```json
+{
+  "key": "TASK_B",
+  "status": "error",
+  "result": {
+    "exception": "500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict",
+    "traceback": "Traceback (most recent call last):\n  File \".../celery/app/trace.py\", ...\nrequests.exceptions.HTTPError: 500 Server Error: ..."
+  }
+}
+```
+
+**Pending task** (never reached due to upstream failure):
+```json
+{
+  "key": "TASK_D",
+  "status": "pending",
+  "result": null
+}
+```
+
+The five possible task states in Director: `pending` → `progress` → `success` / `error` / `canceled`.
+
+### Method 2: Redis Result Backend (Direct)
+
+Each task result is stored in Redis db 1 as a JSON string, keyed by `celery-task-meta-<task_id>`:
+
+```bash
+# Query directly from Redis
+redis-cli -n 1 GET "celery-task-meta-<task_id>"
+```
+
+```json
+{
+  "status": "FAILURE",
+  "result": {
+    "exc_type": "HTTPError",
+    "exc_message": ["500 Server Error: INTERNAL SERVER ERROR for url: ..."],
+    "exc_module": "requests.exceptions"
+  },
+  "traceback": "Traceback (most recent call last): ...",
+  "task_id": "12c5fa43-f070-4004-bf13-75707ba72e1d",
+  "parent_id": "3a75c9e1-616f-4859-b6e4-b71f98ecd8b4",
+  "group_id": "d2c294fc-51f2-404f-b180-a6f4d3c41e1b",
+  "date_done": "2026-03-22T12:34:23.958757+00:00"
+}
+```
+
+Note: Celery uses uppercase states (`PENDING`, `STARTED`, `SUCCESS`, `FAILURE`, `RETRY`) while Director uses lowercase (`pending`, `progress`, `success`, `error`).
+
+### Method 3: Celery Python API (`AsyncResult`)
+
+In application code, use `AsyncResult` to query any task by its ID:
+
+```python
+from celery import Celery
+
+app = Celery(broker="redis://localhost:6379/0", backend="redis://localhost:6379/1")
+result = app.AsyncResult("12c5fa43-f070-4004-bf13-75707ba72e1d")
+
+result.state      # 'SUCCESS' | 'FAILURE' | 'PENDING' | 'RETRY' | 'STARTED'
+result.result     # return value (success) or exception instance (failure)
+result.traceback  # full traceback string (failure only)
+result.date_done  # completion timestamp
+```
+
+### Where Does the Task ID Come From?
+
+```
+  ┌────────────────────┐     ┌──────────────────────────────────────────┐
+  │  POST /api/workflows│     │  Response:                               │
+  │  (trigger workflow) │────►│  {"id": "69766e17-..."}  ← workflow_id   │
+  └────────────────────┘     └──────────────────────────────────────────┘
+                                       │
+                                       ▼
+  ┌────────────────────────────┐     ┌──────────────────────────────────┐
+  │  GET /api/workflows/<wf_id>│────►│  "tasks": [                      │
+  └────────────────────────────┘     │    {"id":"3a75c...", "key":"A"}, │
+                                      │    {"id":"12c5f...", "key":"B"}, │ ← task_id
+                                      │    ...                          │
+                                      │  ]                              │
+                                      └──────────────────────────────────┘
+```
+
+The workflow ID is returned when you trigger it. Each task's ID is found inside the workflow detail response. You can then use any of the three methods above to inspect individual task status and errors.
+
+---
+
 ## Retry Strategy Comparison
 
 | Task | Strategy | Key Parameters | Behavior |
