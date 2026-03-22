@@ -281,6 +281,122 @@ curl -X POST http://localhost:8000/api/workflows \
 
 A 成功 → B 重试 3 次后失败、C 成功 → chord 中有依赖失败 → 抛出 `ChordError` → TASK_D 不执行 → workflow `error`。
 
+---
+
+## 查看任务状态和错误信息
+
+每个任务执行后都可以通过 task_id 查询其状态和结果（包括错误详情）。有三种方式：
+
+### 方式 1：Director REST API（推荐）
+
+Director API 返回完整的 workflow 详情，包含每个 task 的状态、返回值和错误堆栈：
+
+```bash
+# 查 workflow 详情
+curl -s http://localhost:8000/api/workflows/<workflow_id> | python3 -m json.tool
+```
+
+**成功的 task** 返回业务数据：
+```json
+{
+  "key": "TASK_A",
+  "status": "success",
+  "result": {
+    "processed": "HELLO WORLD",
+    "length": 11,
+    "model": "text-preprocessor-v1",
+    "retries_used": 0
+  }
+}
+```
+
+**失败的 task** 返回异常信息和完整 traceback：
+```json
+{
+  "key": "TASK_B",
+  "status": "error",
+  "result": {
+    "exception": "500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict",
+    "traceback": "Traceback (most recent call last):\n  File \".../celery/app/trace.py\", ...\nrequests.exceptions.HTTPError: 500 Server Error: ..."
+  }
+}
+```
+
+**未执行的 task**（因上游失败而未到达）：
+```json
+{
+  "key": "TASK_D",
+  "status": "pending",
+  "result": null
+}
+```
+
+Director 中任务的五种状态：`pending` → `progress` → `success` / `error` / `canceled`。
+
+### 方式 2：直接查 Redis Result Backend
+
+每个 task 的结果以 JSON 存储在 Redis db 1 中，key 为 `celery-task-meta-<task_id>`：
+
+```bash
+redis-cli -n 1 GET "celery-task-meta-<task_id>"
+```
+
+```json
+{
+  "status": "FAILURE",
+  "result": {
+    "exc_type": "HTTPError",
+    "exc_message": ["500 Server Error: INTERNAL SERVER ERROR for url: ..."],
+    "exc_module": "requests.exceptions"
+  },
+  "traceback": "Traceback (most recent call last): ...",
+  "task_id": "12c5fa43-...",
+  "parent_id": "3a75c9e1-...",
+  "group_id": "d2c294fc-...",
+  "date_done": "2026-03-22T12:34:23.958757+00:00"
+}
+```
+
+注意：Celery 原生使用大写状态（`PENDING`、`STARTED`、`SUCCESS`、`FAILURE`、`RETRY`），Director 使用小写（`pending`、`progress`、`success`、`error`）。
+
+### 方式 3：Celery Python API（`AsyncResult`）
+
+在代码中通过 `AsyncResult` 按 task_id 查询：
+
+```python
+from celery import Celery
+
+app = Celery(broker="redis://localhost:6379/0", backend="redis://localhost:6379/1")
+result = app.AsyncResult("12c5fa43-f070-4004-bf13-75707ba72e1d")
+
+result.state      # 'SUCCESS' | 'FAILURE' | 'PENDING' | 'RETRY' | 'STARTED'
+result.result     # 返回值（成功时）或异常实例（失败时）
+result.traceback  # 完整 traceback 字符串（仅失败时有值）
+result.date_done  # 完成时间戳
+```
+
+### task_id 从哪来？
+
+```
+  ┌────────────────────┐     ┌───────────────────────────────────────┐
+  │  POST /api/workflows│     │  Response:                            │
+  │  （触发 workflow）   │────►│  {"id": "69766e17-..."}  ← workflow_id│
+  └────────────────────┘     └───────────────────────────────────────┘
+                                       │
+                                       ▼
+  ┌────────────────────────────┐     ┌──────────────────────────────────┐
+  │  GET /api/workflows/<wf_id>│────►│  "tasks": [                      │
+  └────────────────────────────┘     │    {"id":"3a75c...", "key":"A"}, │
+                                      │    {"id":"12c5f...", "key":"B"}, │ ← task_id
+                                      │    ...                          │
+                                      │  ]                              │
+                                      └──────────────────────────────────┘
+```
+
+触发 workflow 时返回 workflow_id，查 workflow 详情时返回每个 task 的 id。然后可以用上述三种方式查单个 task 的状态和错误信息。
+
+---
+
 ## Retry 策略对比
 
 | Task | 策略 | 关键参数 | 说明 |
